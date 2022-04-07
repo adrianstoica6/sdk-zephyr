@@ -70,6 +70,10 @@ struct data_sent {
 	uint16_t len;
 };
 
+
+
+
+
 #define data_sent(buf) ((struct data_sent *)net_buf_user_data(buf))
 
 static sys_slist_t servers;
@@ -80,6 +84,14 @@ static sys_slist_t servers;
 struct bt_l2cap {
 	/* The channel this context is associated with */
 	struct bt_l2cap_le_chan	chan;
+};
+extern struct bt_dev bt_dev;
+
+static struct k_poll_event events[1] = {
+		K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_FIFO_DATA_AVAILABLE,
+						K_POLL_MODE_NOTIFY_ONLY,
+						&bt_dev.cmd_tx_queue,
+						BT_EVENT_CONN_TX_QUEUE),
 };
 
 static struct bt_l2cap bt_l2cap_pool[CONFIG_BT_MAX_CONN];
@@ -293,6 +305,7 @@ static void l2cap_rx_process(struct k_work *work)
 		l2cap_chan_le_recv(ch, buf);
 		net_buf_unref(buf);
 	}
+
 }
 #endif /* CONFIG_BT_L2CAP_DYNAMIC_CHANNEL */
 
@@ -855,7 +868,69 @@ static struct net_buf *l2cap_chan_le_get_tx_buf(struct bt_l2cap_le_chan *ch)
 
 static int l2cap_chan_le_send_sdu(struct bt_l2cap_le_chan *ch,
 				  struct net_buf **buf, uint16_t sent);
+static int l2cap_chan_tx_resume(struct bt_l2cap_le_chan *ch);
+static void process_events(struct k_poll_event *ev, int count, struct bt_l2cap_le_chan *ch)
+{
+	for (; count; ev++, count--) {
+		BT_DBG("ev->state %u", ev->state);
 
+		switch (ev->state) {
+		case K_POLL_STATE_SIGNALED:
+			BT_INFO("SIG");
+			break;
+		case K_POLL_STATE_FIFO_DATA_AVAILABLE:
+
+			if (IS_ENABLED(CONFIG_BT_CONN) ||
+				   IS_ENABLED(CONFIG_BT_ISO)) {
+				if (ev->tag == BT_EVENT_CONN_TX_QUEUE) {
+					BT_INFO("WE RESUMING");
+					l2cap_chan_tx_resume(ch);
+				}
+			}
+			break;
+		case K_POLL_STATE_NOT_READY:
+			BT_INFO("NOT READY");
+			break;
+		default:
+			BT_INFO("Unexpected k_poll event state %u", ev->state);
+			break;
+		}
+
+	}
+}
+static void l2cap_chan_connected(struct k_work *work){
+	while (1) {
+
+		struct bt_l2cap_le_chan *ch;
+		//struct net_buf *buf;
+
+		ch = CONTAINER_OF(work, struct bt_l2cap_le_chan, tx_conn_work);
+		struct bt_l2cap_chan *chan;
+		SYS_SLIST_FOR_EACH_CONTAINER(&ch->chan.conn->channels, chan, node) {
+			int ev_count, err;
+
+			events[0].state = K_POLL_STATE_NOT_READY;
+			ev_count = 1;
+
+			if (IS_ENABLED(CONFIG_BT_CONN) || IS_ENABLED(CONFIG_BT_ISO)) {
+				ev_count += bt_conn_prepare_events(&events[1]);
+			}
+
+			BT_DBG("Calling k_poll with %d events", ev_count);
+
+			err = k_poll(events, ev_count, K_FOREVER);
+			BT_ASSERT(err == 0);
+
+			process_events(events, ev_count, BT_L2CAP_LE_CHAN(chan));
+
+			/* Make sure we don't hog the CPU if there's all the time
+			* some ready events.
+			*/
+			k_yield();
+		}
+		k_yield();
+	}
+}
 static void l2cap_chan_tx_process(struct k_work *work)
 {
 	struct bt_l2cap_le_chan *ch;
@@ -863,22 +938,25 @@ static void l2cap_chan_tx_process(struct k_work *work)
 
 	ch = CONTAINER_OF(work, struct bt_l2cap_le_chan, tx_work);
 
+
+	//BT_INFO("HERE");
+
+
 	/* Resume tx in case there are buffers in the queue */
-	while ((buf = l2cap_chan_le_get_tx_buf(ch))) {
+	if((buf = l2cap_chan_le_get_tx_buf(ch))) {
 		int sent = data_sent(buf)->len;
-
-		BT_DBG("buf %p sent %u", buf, sent);
-
 		sent = l2cap_chan_le_send_sdu(ch, &buf, sent);
 		if (sent < 0) {
+			BT_INFO("EERRORROR %d", sent);
 			if (sent == -EAGAIN) {
 				ch->tx_buf = buf;
+
 			} else {
 				net_buf_unref(buf);
 			}
-			break;
 		}
 	}
+
 }
 
 static void l2cap_chan_tx_init(struct bt_l2cap_le_chan *chan)
@@ -889,6 +967,9 @@ static void l2cap_chan_tx_init(struct bt_l2cap_le_chan *chan)
 	atomic_set(&chan->tx.credits, 0);
 	k_fifo_init(&chan->tx_queue);
 	k_work_init(&chan->tx_work, l2cap_chan_tx_process);
+	k_work_init(&chan->tx_conn_work, l2cap_chan_connected);
+	//k_work_submit(&chan->tx_conn_work);
+
 }
 
 static void l2cap_chan_tx_give_credits(struct bt_l2cap_le_chan *chan,
@@ -1650,7 +1731,7 @@ static void le_conn_rsp(struct bt_l2cap *l2cap, uint8_t ident,
 
 		/* Update state */
 		bt_l2cap_chan_set_state(&chan->chan, BT_L2CAP_CONNECTED);
-
+		//BT_INFO("DO WE EVEN GET HERE?");
 		if (chan->chan.ops->connected) {
 			chan->chan.ops->connected(&chan->chan);
 		}
@@ -1762,14 +1843,15 @@ segment:
 	return seg;
 }
 
-static void l2cap_chan_tx_resume(struct bt_l2cap_le_chan *ch)
+static int l2cap_chan_tx_resume(struct bt_l2cap_le_chan *ch)
 {
 	if (!atomic_get(&ch->tx.credits) ||
 	    (k_fifo_is_empty(&ch->tx_queue) && !ch->tx_buf)) {
-		return;
+		return 1;
 	}
 
 	k_work_submit(&ch->tx_work);
+	return 0;
 }
 
 static void l2cap_chan_sdu_sent(struct bt_conn *conn, void *user_data)
@@ -1789,7 +1871,9 @@ static void l2cap_chan_sdu_sent(struct bt_conn *conn, void *user_data)
 		chan->ops->sent(chan);
 	}
 
-	l2cap_chan_tx_resume(BT_L2CAP_LE_CHAN(chan));
+	SYS_SLIST_FOR_EACH_CONTAINER(&conn->channels, chan, node) {
+		l2cap_chan_tx_resume(BT_L2CAP_LE_CHAN(chan));
+	}
 }
 
 static void l2cap_chan_seg_sent(struct bt_conn *conn, void *user_data)
@@ -1804,8 +1888,10 @@ static void l2cap_chan_seg_sent(struct bt_conn *conn, void *user_data)
 		/* Received segment sent callback for disconnected channel */
 		return;
 	}
-
-	l2cap_chan_tx_resume(BT_L2CAP_LE_CHAN(chan));
+	SYS_SLIST_FOR_EACH_CONTAINER(&conn->channels, chan, node) {
+		l2cap_chan_tx_resume(BT_L2CAP_LE_CHAN(chan));
+	}
+	//l2cap_chan_tx_resume(BT_L2CAP_LE_CHAN(chan));
 }
 
 static bool test_and_dec(atomic_t *target)
@@ -1834,13 +1920,13 @@ static bool test_and_dec(atomic_t *target)
  * In all cases the original buffer is unaffected so it can be pushed back to
  * be sent later.
  */
+
 static int l2cap_chan_le_send(struct bt_l2cap_le_chan *ch,
 			      struct net_buf *buf, uint16_t sdu_hdr_len)
 {
 	struct net_buf *seg;
 	struct net_buf_simple_state state;
 	int len, err;
-
 	if (!test_and_dec(&ch->tx.credits)) {
 		BT_WARN("No credits to transmit packet");
 		return -EAGAIN;
@@ -1875,6 +1961,10 @@ static int l2cap_chan_le_send(struct bt_l2cap_le_chan *ch,
 
 	if (err) {
 		BT_WARN("Unable to send seg %d", err);
+
+		//k_work_submit(&ch->tx_conn_work);
+
+
 		atomic_inc(&ch->tx.credits);
 
 		/* If the segment is not the original buffer release it since it
@@ -1889,7 +1979,10 @@ static int l2cap_chan_le_send(struct bt_l2cap_le_chan *ch,
 			net_buf_simple_restore(&buf->b, &state);
 			return -EAGAIN;
 		}
-
+		if(!k_work_busy_get(&ch->tx_conn_work)){
+			net_buf_put(&ch->tx_queue, buf);
+			k_work_submit(&ch->tx_conn_work);
+		}
 		return err;
 	}
 
@@ -1904,6 +1997,8 @@ static int l2cap_chan_le_send(struct bt_l2cap_le_chan *ch,
 	}
 
 	return len;
+	//}
+	//return -EAGAIN;
 }
 
 static int l2cap_chan_le_send_sdu(struct bt_l2cap_le_chan *ch,
@@ -2000,7 +2095,9 @@ static void le_credits(struct bt_l2cap *l2cap, uint8_t ident,
 
 	BT_DBG("chan %p total credits %lu", ch, atomic_get(&ch->tx.credits));
 
-	l2cap_chan_tx_resume(ch);
+	//SYS_SLIST_FOR_EACH_CONTAINER(&conn->channels, chan, node) {
+		l2cap_chan_tx_resume(BT_L2CAP_LE_CHAN(chan));
+	//}
 }
 
 static void reject_cmd(struct bt_l2cap *l2cap, uint8_t ident,
@@ -2568,6 +2665,8 @@ static int l2cap_le_connect(struct bt_conn *conn, struct bt_l2cap_le_chan *ch,
 		atomic_set_bit(ch->chan.status,
 			       BT_L2CAP_STATUS_ENCRYPT_PENDING);
 
+		//k_work_submit(&ch->tx_conn_work);
+
 		return 0;
 	}
 
@@ -2575,6 +2674,8 @@ static int l2cap_le_connect(struct bt_conn *conn, struct bt_l2cap_le_chan *ch,
 	if (err) {
 		goto fail;
 	}
+
+	//k_work_submit(&ch->tx_conn_work);
 
 	return 0;
 
@@ -2812,6 +2913,8 @@ int bt_l2cap_chan_disconnect(struct bt_l2cap_chan *chan)
 	return 0;
 }
 
+
+
 int bt_l2cap_chan_send(struct bt_l2cap_chan *chan, struct net_buf *buf)
 {
 	struct bt_l2cap_le_chan *ch = BT_L2CAP_LE_CHAN(chan);
@@ -2844,17 +2947,20 @@ int bt_l2cap_chan_send(struct bt_l2cap_chan *chan, struct net_buf *buf)
 		data_sent(buf)->len = 0;
 		net_buf_put(&ch->tx_queue, buf);
 		k_work_submit(&ch->tx_work);
+
 		return 0;
 	}
+
 
 	err = l2cap_chan_le_send_sdu(ch, &buf, 0);
 	if (err < 0) {
 		if (err == -EAGAIN && data_sent(buf)->len) {
 			/* Queue buffer if at least one segment could be sent */
 			net_buf_put(&ch->tx_queue, buf);
+
 			return data_sent(buf)->len;
-		}
 		BT_ERR("failed to send message %d", err);
+		}
 	}
 
 	return err;

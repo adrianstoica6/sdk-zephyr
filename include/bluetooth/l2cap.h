@@ -189,6 +189,8 @@ struct bt_l2cap_le_chan {
 	struct net_buf                  *tx_buf;
 	/** Channel Transmission work  */
 	struct k_work			tx_work;
+
+	struct k_work 			tx_conn_work;
 	/** Segment SDU packet from upper layer */
 	struct net_buf			*_sdu;
 	uint16_t				_sdu_len;

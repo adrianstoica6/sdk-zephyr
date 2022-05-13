@@ -80,7 +80,7 @@ struct bt_l2cap {
 	/* The channel this context is associated with */
 	struct bt_l2cap_le_chan	chan;
 };
-
+bool resume = false;
 static const struct bt_l2cap_ecred_cb *ecred_cb;
 static struct bt_l2cap bt_l2cap_pool[CONFIG_BT_MAX_CONN];
 
@@ -490,6 +490,25 @@ static int l2cap_le_conn_req(struct bt_l2cap_le_chan *ch)
 	return 0;
 }
 
+static void l2cap_chan_tx_resume(struct bt_l2cap_le_chan *ch)
+{
+	if (!atomic_get(&ch->tx.credits) ||
+	    (k_fifo_is_empty(&ch->tx_queue) && !ch->tx_buf)) {
+		return;
+	}
+
+	k_work_submit(&ch->tx_work);
+}
+
+void resume_all_l2cap__loop_body(struct bt_conn *conn, void *data) {
+	struct bt_l2cap_chan *chan;
+	SYS_SLIST_FOR_EACH_CONTAINER(&conn->channels, chan, node) {
+		l2cap_chan_tx_resume(BT_L2CAP_LE_CHAN(chan));
+	}
+}
+void resume_all_l2cap() {
+	bt_conn_foreach(BT_CONN_TYPE_ALL, resume_all_l2cap__loop_body, NULL);
+}
 #if defined(CONFIG_BT_L2CAP_ECRED)
 static int l2cap_ecred_conn_req(struct bt_l2cap_chan **chan, int channels)
 {
@@ -893,15 +912,32 @@ static void l2cap_chan_tx_process(struct k_work *work)
 		}
 	}
 }
-
+int resume_counter = 0;
+static void on_tx_event(struct k_work *work)
+{
+	resume_counter++;
+	if(resume || resume_counter > 3){
+			resume_counter = 0;
+			resume = false;
+			resume_all_l2cap();
+	}
+}
 static void l2cap_chan_tx_init(struct bt_l2cap_le_chan *chan)
 {
+	static struct k_poll_event events[1] = {
+		K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_FIFO_DATA_AVAILABLE,
+						K_POLL_MODE_NOTIFY_ONLY,
+						&bt_dev.cmd_tx_queue,
+						BT_EVENT_CMD_TX),
+	};
 	BT_DBG("chan %p", chan);
 
 	(void)memset(&chan->tx, 0, sizeof(chan->tx));
 	atomic_set(&chan->tx.credits, 0);
 	k_fifo_init(&chan->tx_queue);
 	k_work_init(&chan->tx_work, l2cap_chan_tx_process);
+	k_work_poll_init(&chan->tx_more_work, on_tx_event);
+	k_work_poll_submit(&chan->tx_more_work, events, 1, K_NO_WAIT);
 }
 
 static void l2cap_chan_tx_give_credits(struct bt_l2cap_le_chan *chan,
@@ -1798,15 +1834,7 @@ segment:
 	return seg;
 }
 
-static void l2cap_chan_tx_resume(struct bt_l2cap_le_chan *ch)
-{
-	if (!atomic_get(&ch->tx.credits) ||
-	    (k_fifo_is_empty(&ch->tx_queue) && !ch->tx_buf)) {
-		return;
-	}
 
-	k_work_submit(&ch->tx_work);
-}
 
 static void l2cap_chan_sdu_sent(struct bt_conn *conn, void *user_data)
 {
@@ -1824,8 +1852,6 @@ static void l2cap_chan_sdu_sent(struct bt_conn *conn, void *user_data)
 	if (chan->ops->sent) {
 		chan->ops->sent(chan);
 	}
-
-	l2cap_chan_tx_resume(BT_L2CAP_LE_CHAN(chan));
 }
 
 static void l2cap_chan_seg_sent(struct bt_conn *conn, void *user_data)
@@ -1840,8 +1866,6 @@ static void l2cap_chan_seg_sent(struct bt_conn *conn, void *user_data)
 		/* Received segment sent callback for disconnected channel */
 		return;
 	}
-
-	l2cap_chan_tx_resume(BT_L2CAP_LE_CHAN(chan));
 }
 
 static bool test_and_dec(atomic_t *target)
@@ -1995,7 +2019,7 @@ static int l2cap_chan_le_send_sdu(struct bt_l2cap_le_chan *ch,
 	       total_len);
 
 	net_buf_unref(frag);
-
+	resume = true;
 	return ret;
 }
 
@@ -2036,8 +2060,7 @@ static void le_credits(struct bt_l2cap *l2cap, uint8_t ident,
 
 	BT_DBG("chan %p total credits %lu",
 	       le_chan, atomic_get(&le_chan->tx.credits));
-
-	l2cap_chan_tx_resume(le_chan);
+	resume_all_l2cap();
 }
 
 static void reject_cmd(struct bt_l2cap *l2cap, uint8_t ident,
@@ -2884,10 +2907,10 @@ int bt_l2cap_chan_send(struct bt_l2cap_chan *chan, struct net_buf *buf)
 {
 	struct bt_l2cap_le_chan *le_chan = BT_L2CAP_LE_CHAN(chan);
 	int err;
-
 	if (!buf) {
 		return -EINVAL;
 	}
+
 
 	BT_DBG("chan %p buf %p len %zu", chan, buf, net_buf_frags_len(buf));
 
@@ -2903,7 +2926,6 @@ int bt_l2cap_chan_send(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	    chan->conn->type == BT_CONN_TYPE_BR) {
 		return bt_l2cap_br_chan_send(chan, buf);
 	}
-
 	/* Queue if there are pending segments left from previous packet or
 	 * there are no credits available.
 	 */
@@ -2911,7 +2933,6 @@ int bt_l2cap_chan_send(struct bt_l2cap_chan *chan, struct net_buf *buf)
 	    !atomic_get(&le_chan->tx.credits)) {
 		data_sent(buf)->len = 0;
 		net_buf_put(&le_chan->tx_queue, buf);
-		k_work_submit(&le_chan->tx_work);
 		return 0;
 	}
 
